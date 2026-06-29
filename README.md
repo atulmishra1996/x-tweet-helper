@@ -157,7 +157,7 @@ Tweet Studio on mobile uses **AI | Write | Reply** tabs so hooks and threads are
 ```
 app/           Next.js App Router (UI + /api routes)
 components/    UI + feature modules (tweet, blog, dashboard, …)
-lib/           Auth, DB, LLM factory, X client, prompts, analytics
+lib/           Auth, DB, LLM factory, X client, prompts, analytics, rate-limit
 workers/       pg-boss jobs: scheduled posts, metric sync, growth
 drizzle/       SQL migrations
 scripts/       dev-lan, Antigravity patch, backup
@@ -201,6 +201,12 @@ For production mobile/LAN, prefer `npm run build && npm run start -- -H 0.0.0.0`
 - LLM and X calls are **server-side only**; keys never reach the browser.
 - Sessions use signed **HttpOnly** cookies.
 - Cron routes require `Authorization: Bearer <CRON_SECRET>` in production.
+
+## Reliability & Cost Controls
+
+- **Transactional publishing**: Post publishing uses database transactions + atomic claim guards. This prevents duplicate posts and inconsistent state when the API and background worker run concurrently.
+- **AI rate limiting**: Generation endpoints (`/api/ai/tweet` and `/api/ai/blog`) are protected with per-user sliding-window rate limits (10 tweet generations/min, 5 blog generations/2min by default). Returns proper `429` + `Retry-After` headers.
+- These changes protect against runaway LLM costs and improve consistency for scheduled + manual publishing flows.
 
 ---
 

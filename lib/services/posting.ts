@@ -1,4 +1,4 @@
-import { and, eq, lte } from "drizzle-orm";
+import { and, eq, lte, ne } from "drizzle-orm";
 import { db } from "@/lib/db/client";
 import { posts, users, auditLog, type Post } from "@/lib/db/schema";
 import { postTweet, postThread } from "@/lib/x/client";
@@ -11,54 +11,103 @@ const log = scoped("posting");
 /**
  * Publish a draft/scheduled post to X. Used by both the "Post now" API route
  * and the scheduled-post worker, so behavior is identical either way.
- * Idempotent: a post already marked "posted" is returned untouched.
+ *
+ * Safety improvements:
+ * - Strong conditional claim (only move draft/scheduled/failed → posting)
+ * - Final state changes (posted + activity + audit) run inside a transaction
+ * - External X call happens outside any transaction
  */
 export async function publishPost(userId: number, postId: number): Promise<Post> {
-  const [post] = await db.select().from(posts).where(eq(posts.id, postId)).limit(1);
-  if (!post || post.userId !== userId) throw new NotFoundError("Post not found");
+  // Load and basic ownership check
+  const [post] = await db
+    .select()
+    .from(posts)
+    .where(and(eq(posts.id, postId), eq(posts.userId, userId)))
+    .limit(1);
+
+  if (!post) throw new NotFoundError("Post not found");
   if (post.status === "posted") return post;
 
   const [user] = await db.select().from(users).where(eq(users.id, userId)).limit(1);
   if (!user) throw new NotFoundError("User not found");
 
-  await db.update(posts).set({ status: "posting", updatedAt: new Date() }).where(eq(posts.id, postId));
+  // === Claim the post atomically (prevents double-publish) ===
+  // Only allow transition from safe states into "posting".
+  const [claimed] = await db
+    .update(posts)
+    .set({ status: "posting", updatedAt: new Date() })
+    .where(
+      and(
+        eq(posts.id, postId),
+        eq(posts.userId, userId),
+        ne(posts.status, "posted"),
+        ne(posts.status, "posting"), // critical: don't steal an in-flight claim
+      ),
+    )
+    .returning();
+
+  if (!claimed || claimed.status !== "posting") {
+    // Another process claimed it, or it was already posted
+    // Re-fetch latest state
+    const [latest] = await db.select().from(posts).where(eq(posts.id, postId)).limit(1);
+    if (latest?.status === "posted") return latest;
+    if (latest?.status === "posting") {
+      throw new AppError("VALIDATION_ERROR", "Post is already being published", 409);
+    }
+    throw new AppError("VALIDATION_ERROR", "Post is already being processed or in an invalid state", 409);
+  }
 
   try {
-    const content = post.content.filter((t) => t.trim().length > 0);
-    if (content.length === 0) throw new AppError("VALIDATION_ERROR", "Post has no content", 422);
+    const content = claimed.content.filter((t) => t.trim().length > 0);
+    if (content.length === 0) {
+      throw new AppError("VALIDATION_ERROR", "Post has no content", 422);
+    }
 
     const tweetIds =
-      post.type === "thread" || content.length > 1
+      claimed.type === "thread" || content.length > 1
         ? await postThread(user, content)
         : [(await postTweet(user, content[0])).id];
 
-    const [updated] = await db
-      .update(posts)
-      .set({
-        status: "posted",
-        postedTweetIds: tweetIds,
-        postedAt: new Date(),
-        error: null,
-        updatedAt: new Date(),
-      })
-      .where(eq(posts.id, postId))
-      .returning();
+    // === Finalize inside a transaction so activity + audit are consistent ===
+    const updated = await db.transaction(async (tx) => {
+      const [u] = await tx
+        .update(posts)
+        .set({
+          status: "posted",
+          postedTweetIds: tweetIds,
+          postedAt: new Date(),
+          error: null,
+          updatedAt: new Date(),
+        })
+        .where(and(eq(posts.id, postId), eq(posts.status, "posting")))
+        .returning();
 
-    await recordPublished(userId, 1);
-    await db.insert(auditLog).values({
-      userId,
-      action: "post.published",
-      entity: `post:${postId}`,
-      metadata: { tweetIds },
+      await recordPublished(userId, 1, tx as any);
+      await tx.insert(auditLog).values({
+        userId,
+        action: "post.published",
+        entity: `post:${postId}`,
+        metadata: { tweetIds },
+      });
+
+      return u;
     });
+
     log.info({ postId, tweetIds }, "Post published");
     return updated;
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to publish";
-    await db
-      .update(posts)
-      .set({ status: "failed", error: message, updatedAt: new Date() })
-      .where(eq(posts.id, postId));
+
+    // Best-effort revert only if we still own the "posting" claim
+    try {
+      await db
+        .update(posts)
+        .set({ status: "failed", error: message, updatedAt: new Date() })
+        .where(and(eq(posts.id, postId), eq(posts.status, "posting")));
+    } catch (revertErr) {
+      log.error({ revertErr, postId }, "Failed to mark post as failed");
+    }
+
     log.error({ err, postId }, "Post publish failed");
     throw err;
   }

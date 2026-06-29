@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { ZodError } from "zod";
-import { AppError } from "@/lib/errors";
+import { AppError, RateLimitError } from "@/lib/errors";
 import { scoped } from "@/lib/logger";
 import { captureException } from "@/lib/observability";
 
@@ -11,7 +11,17 @@ export function ok<T>(data: T, init?: ResponseInit) {
 }
 
 export function fail(code: string, message: string, status = 400, details?: unknown) {
-  return NextResponse.json({ error: { code, message, details } }, { status });
+  const headers: Record<string, string> = {};
+  if (
+    status === 429 &&
+    details &&
+    typeof details === "object" &&
+    "retryAfter" in details &&
+    typeof (details as any).retryAfter === "number"
+  ) {
+    headers["Retry-After"] = String((details as any).retryAfter);
+  }
+  return NextResponse.json({ error: { code, message, details } }, { status, headers });
 }
 
 /** Wrap a route handler with consistent error handling. */
@@ -20,6 +30,9 @@ export function handle<Args extends unknown[]>(fn: (...args: Args) => Promise<Ne
     try {
       return await fn(...args);
     } catch (err) {
+      if (err instanceof RateLimitError) {
+        return fail(err.code, err.message, err.status, { retryAfter: err.retryAfterSeconds });
+      }
       if (err instanceof AppError) {
         if (err.status >= 500) log.error({ err }, err.message);
         return fail(err.code, err.message, err.status, err.details);

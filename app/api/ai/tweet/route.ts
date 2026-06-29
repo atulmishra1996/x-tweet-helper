@@ -3,6 +3,8 @@ import { handle, ok } from "@/lib/api";
 import { requireUser } from "@/lib/auth/session";
 import { getOrCreateSettings } from "@/lib/settings";
 import { generate } from "@/lib/llm/factory";
+import { RateLimitError } from "@/lib/errors";
+import { checkAiRateLimit } from "@/lib/rate-limit";
 import {
   tweetVariants,
   tweetAction,
@@ -33,6 +35,16 @@ const schema = z.object({
 
 export const POST = handle(async (req: Request) => {
   const user = await requireUser();
+
+  // Rate limit AI generation to protect costs and resources
+  const rl = checkAiRateLimit(user.id, "tweet");
+  if (!rl.allowed) {
+    throw new RateLimitError(
+      `Too many AI requests. Please try again in ${rl.retryAfterSeconds}s.`,
+      rl.retryAfterSeconds,
+    );
+  }
+
   const body = schema.parse(await req.json());
   const { voicePrompt } = await getOrCreateSettings(user.id);
   const voice = voicePrompt ?? undefined;

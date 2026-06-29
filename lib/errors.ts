@@ -6,6 +6,7 @@ export type ErrorCode =
   | "PROVIDER_ERROR"
   | "X_API_ERROR"
   | "X_RATE_LIMITED"
+  | "RATE_LIMITED"
   | "VALIDATION_ERROR"
   | "NOT_FOUND"
   | "INTERNAL";
@@ -46,6 +47,15 @@ export class RateLimitedError extends AppError {
   retryAfterSeconds?: number;
   constructor(message = "Rate limited by X API", retryAfterSeconds?: number) {
     super("X_RATE_LIMITED", message, 429);
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+/** General rate limit error (for AI generation, etc.) */
+export class RateLimitError extends AppError {
+  retryAfterSeconds?: number;
+  constructor(message = "Too many requests", retryAfterSeconds?: number) {
+    super("RATE_LIMITED", message, 429);
     this.retryAfterSeconds = retryAfterSeconds;
   }
 }
